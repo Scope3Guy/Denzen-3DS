@@ -1,0 +1,130 @@
+name: Windows Test Build
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - master
+      - system_file_cia_fix
+    tags:
+      - "*"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-test-build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  windows-msys2:
+    name: Windows x64 MSYS2
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: msys2 {0}
+    env:
+      CCACHE_DIR: ${{ github.workspace }}/.ccache
+      CCACHE_COMPILERCHECK: content
+      CCACHE_SLOPPINESS: time_macros
+      OS: windows
+      TARGET: msys2
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          submodules: recursive
+
+      - name: Cache ccache
+        uses: actions/cache@v5
+        with:
+          path: ${{ env.CCACHE_DIR }}
+          key: windows-msys2-${{ github.sha }}
+          restore-keys: |
+            windows-msys2-
+
+      - name: Set up MSYS2
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: clang64
+          update: true
+          install: git make p7zip
+          pacboy: >-
+            toolchain:p ccache:p cmake:p ninja:p spirv-tools:p
+            qt6-base:p qt6-multimedia:p qt6-multimedia-wmf:p qt6-tools:p qt6-translations:p
+
+      - name: Disable line ending translation
+        run: git config --global core.autocrlf input
+
+      - name: Build Windows bundle
+        run: ./.ci/windows.sh
+
+      - name: Pack artifact
+        run: ./.ci/pack.sh
+
+      - name: Upload Windows artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: denzen-emu-windows-msys2-${{ github.sha }}
+          path: artifacts/
+          if-no-files-found: error
+          retention-days: 14
+
+  publish-release:
+    name: Publish GitHub release
+    needs: windows-msys2
+    if: ${{ github.ref_type == 'tag' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      actions: read
+    steps:
+      - name: Download Windows artifact
+        uses: actions/download-artifact@v7
+        with:
+          name: denzen-emu-windows-msys2-${{ github.sha }}
+          path: release-artifacts/windows-msys2
+
+      - name: Prepare release assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p release-files
+
+          while IFS= read -r -d '' file; do
+            rel="${file#release-artifacts/}"
+            asset="${rel//\//-}"
+            cp "$file" "release-files/$asset"
+          done < <(find release-artifacts -type f -print0)
+
+          asset_count=$(find release-files -maxdepth 1 -type f | wc -l)
+          if [ "$asset_count" -eq 0 ]; then
+            echo "No release assets found" >&2
+            exit 1
+          fi
+
+          find release-files -maxdepth 1 -type f -print | sort
+
+      - name: Create or update GitHub release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+
+          cat > release-notes.md <<EOF
+          Automated Denzen Windows build for ${TAG_NAME}.
+
+          Built from commit ${GITHUB_SHA} by the Windows Test Build workflow.
+          EOF
+
+          if gh release view "$TAG_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$TAG_NAME" release-files/* --repo "$GITHUB_REPOSITORY" --clobber
+          else
+            gh release create "$TAG_NAME" release-files/* \
+              --repo "$GITHUB_REPOSITORY" \
+              --verify-tag \
+              --title "$TAG_NAME" \
+              --notes-file release-notes.md
+          fi
