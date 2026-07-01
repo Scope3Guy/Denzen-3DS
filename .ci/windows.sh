@@ -1,9 +1,10 @@
-#!/bin/sh -ex
+#!/bin/bash -ex
 
 mkdir build && cd build
 
-if [ "$GITHUB_REF_TYPE" == "tag" ]; then
-	export EXTRA_CMAKE_FLAGS=(-DENABLE_QT_UPDATE_CHECKER=ON)
+EXTRA_CMAKE_FLAGS=()
+if [ "${GITHUB_REF_TYPE:-}" = "tag" ]; then
+    EXTRA_CMAKE_FLAGS+=(-DENABLE_QT_UPDATE_CHECKER=ON)
 fi
 
 cmake .. -G Ninja \

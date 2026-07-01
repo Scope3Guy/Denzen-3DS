@@ -6,8 +6,9 @@ export PATH="/mxe/usr/bin:${PATH}"
 
 mkdir build && cd build
 
-if [ "$GITHUB_REF_TYPE" == "tag" ]; then
-	export EXTRA_CMAKE_FLAGS=(-DENABLE_QT_UPDATE_CHECKER=ON)
+EXTRA_CMAKE_FLAGS=()
+if [ "${GITHUB_REF_TYPE:-}" = "tag" ]; then
+    EXTRA_CMAKE_FLAGS+=(-DENABLE_QT_UPDATE_CHECKER=ON)
 fi
 
 x86_64-w64-mingw32.shared-cmake .. \
