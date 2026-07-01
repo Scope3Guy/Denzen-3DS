@@ -7,7 +7,7 @@ This file records tracked files that differ from the upstream Azahar source tree
 Comparison basis:
 
 - Upstream: `azahar-emu/azahar` `master` at `d93adebb16a1137e3dc0a5afb627ef652ff6b569`, fetched on 2026-07-01.
-- Denzen: local `master` at `b7f45e77f6bf14fefc0aa115a6d9a0075d9be90b`.
+- Denzen: public `master` source tree after the 2026-07-01 cleanup that removes internal local-only tooling from the public tree.
 - Scope: tracked top-level source tree files only.
 - Date precision: where private pre-remote work dates are not available, the date is recorded as `2026-06-30 or earlier`, matching the public baseline/import date and local development log evidence.
 
