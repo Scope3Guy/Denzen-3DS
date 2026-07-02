@@ -23,7 +23,7 @@
 #define EMU_DATA_DIR USER_DIR
 #else
 #ifdef _WIN32
-#define EMU_DATA_DIR "Azahar"
+#define EMU_DATA_DIR "Denzen"
 #define LEGACY_CITRA_DATA_DIR "Citra"
 #define LEGACY_LIME3DS_DATA_DIR "Lime3DS"
 #elif defined(__APPLE__)
@@ -71,7 +71,7 @@
 
 // Filenames
 // Files in the directory returned by GetUserPath(UserPath::LogDir)
-#define LOG_FILE "azahar_log.txt"
+#define LOG_FILE "denzen_log.txt"
 
 // Files in the directory returned by GetUserPath(UserPath::ConfigDir)
 #define EMU_CONFIG "emu.ini"

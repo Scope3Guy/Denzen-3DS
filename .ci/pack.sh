@@ -8,14 +8,14 @@ GITREV="`git show -s --format='%h'`"
 mkdir -p artifacts
 
 function pack_artifacts() {
-    REV_NAME="azahar-$OS-$TARGET-$GITDATE-$GITREV"
+    REV_NAME="denzen-$OS-$TARGET-$GITDATE-$GITREV"
 
     # Determine the name of the release being built.
     if [ "$GITHUB_REF_TYPE" = "tag" ]; then
-        RELEASE_NAME=azahar-$GITHUB_REF_NAME
-        REV_NAME="azahar-$OS-$TARGET-$GITHUB_REF_NAME"
+        RELEASE_NAME=denzen-$GITHUB_REF_NAME
+        REV_NAME="denzen-$OS-$TARGET-$GITHUB_REF_NAME"
     else
-        RELEASE_NAME=azahar-head
+        RELEASE_NAME=denzen-head
     fi
 
     ARTIFACTS_PATH="$1"
@@ -58,14 +58,14 @@ if [ -n "$UNPACKED" ]; then
         EXTENSION="${FILENAME##*.}"
 
         # TODO: Deduplicate
-        REV_NAME="azahar-$OS-$TARGET-$GITDATE-$GITREV"
+        REV_NAME="denzen-$OS-$TARGET-$GITDATE-$GITREV"
 
         # Determine the name of the release being built.
         if [ "$GITHUB_REF_TYPE" = "tag" ]; then
-            RELEASE_NAME=azahar-$GITHUB_REF_NAME
-            REV_NAME="azahar-$OS-$TARGET-$GITHUB_REF_NAME"
+            RELEASE_NAME=denzen-$GITHUB_REF_NAME
+            REV_NAME="denzen-$OS-$TARGET-$GITHUB_REF_NAME"
         else
-            RELEASE_NAME=azahar-head
+            RELEASE_NAME=denzen-head
         fi
 
         mv "$ARTIFACT" "artifacts/$REV_NAME.$EXTENSION"

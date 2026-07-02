@@ -152,8 +152,8 @@ void ConfigureGeneral::SetConfiguration() {
 void ConfigureGeneral::ResetDefaults() {
     ui->button_reset_defaults->setEnabled(false);
     QMessageBox::StandardButton answer = QMessageBox::question(
-        this, tr("Azahar"),
-        tr("Are you sure you want to <b>reset your settings</b> and close Azahar?"),
+        this, tr("Denzen"),
+        tr("Are you sure you want to <b>reset your settings</b> and close Denzen?"),
         QMessageBox::Yes | QMessageBox::No, QMessageBox::No);
 
     if (answer == QMessageBox::No) {

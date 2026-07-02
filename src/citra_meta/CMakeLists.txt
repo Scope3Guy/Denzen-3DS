@@ -4,7 +4,7 @@ add_executable(citra_meta
     precompiled_headers.h
 )
 
-set_target_properties(citra_meta PROPERTIES OUTPUT_NAME "azahar")
+set_target_properties(citra_meta PROPERTIES OUTPUT_NAME "denzen")
 
 if (BSD STREQUAL "NetBSD")
     include(DisablePaxMprotect)

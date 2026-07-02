@@ -19,16 +19,17 @@
 
 ManifestDPIAware true
 
-!define PRODUCT_NAME "Azahar"
-!define PRODUCT_PUBLISHER "Azahar Emulator Developers"
-!define PRODUCT_WEB_SITE "https://azahar-emu.org/"
-!define PRODUCT_DIR_REGKEY "Software\Microsoft\Windows\CurrentVersion\App Paths\${PRODUCT_NAME}.exe"
+!define PRODUCT_NAME "Denzen"
+!define PRODUCT_PUBLISHER "Denzen-emu"
+!define PRODUCT_WEB_SITE "https://github.com/Denzen-Project/Denzen-3DS"
+!define PRODUCT_EXE "denzen.exe"
+!define PRODUCT_DIR_REGKEY "Software\Microsoft\Windows\CurrentVersion\App Paths\${PRODUCT_EXE}"
 !define PRODUCT_UNINST_KEY "Software\Microsoft\Windows\CurrentVersion\Uninstall\${PRODUCT_NAME}"
 
 !define BINARY_SOURCE_DIR "..\..\build\bundle"
 
 Name "${PRODUCT_NAME}"
-OutFile "azahar-windows-${PRODUCT_VARIANT}-${PRODUCT_VERSION}-installer.exe"
+OutFile "denzen-windows-${PRODUCT_VARIANT}-${PRODUCT_VERSION}-installer.exe"
 SetCompressor /SOLID lzma
 ShowInstDetails show
 ShowUnInstDetails show
@@ -62,7 +63,7 @@ Page custom desktopShortcutPageCreate desktopShortcutPageLeave
 ; Instfiles page
 !insertmacro MUI_PAGE_INSTFILES
 ; Finish page
-!define MUI_FINISHPAGE_RUN "$INSTDIR\azahar.exe"
+!define MUI_FINISHPAGE_RUN "$INSTDIR\${PRODUCT_EXE}"
 !insertmacro MUI_PAGE_FINISH
 
 ; Uninstaller pages
@@ -163,9 +164,9 @@ Section "Base"
   !insertmacro UPDATE_DISPLAYNAME
 
   ; Create start menu and desktop shortcuts
-  CreateShortCut "$SMPROGRAMS\$DisplayName.lnk" "$INSTDIR\azahar.exe"
+  CreateShortCut "$SMPROGRAMS\$DisplayName.lnk" "$INSTDIR\${PRODUCT_EXE}"
   ${If} $DesktopShortcut == 1
-    CreateShortCut "$DESKTOP\$DisplayName.lnk" "$INSTDIR\azahar.exe"
+    CreateShortCut "$DESKTOP\$DisplayName.lnk" "$INSTDIR\${PRODUCT_EXE}"
   ${EndIf}
 SectionEnd
 
@@ -174,12 +175,12 @@ SectionEnd
 Section -Post
   WriteUninstaller "$INSTDIR\uninst.exe"
 
-  WriteRegStr SHCTX "${PRODUCT_DIR_REGKEY}" "" "$INSTDIR\azahar.exe"
+  WriteRegStr SHCTX "${PRODUCT_DIR_REGKEY}" "" "$INSTDIR\${PRODUCT_EXE}"
 
   ; Write metadata for add/remove programs applet
   WriteRegStr SHCTX "${PRODUCT_UNINST_KEY}" "DisplayName" "$DisplayName"
   WriteRegStr SHCTX "${PRODUCT_UNINST_KEY}" "UninstallString" "$INSTDIR\uninst.exe /$MultiUser.InstallMode"
-  WriteRegStr SHCTX "${PRODUCT_UNINST_KEY}" "DisplayIcon" "$INSTDIR\azahar.exe"
+  WriteRegStr SHCTX "${PRODUCT_UNINST_KEY}" "DisplayIcon" "$INSTDIR\${PRODUCT_EXE}"
   WriteRegStr SHCTX "${PRODUCT_UNINST_KEY}" "DisplayVersion" "${PRODUCT_VERSION}"
   WriteRegStr SHCTX "${PRODUCT_UNINST_KEY}" "URLInfoAbout" "${PRODUCT_WEB_SITE}"
   WriteRegStr SHCTX "${PRODUCT_UNINST_KEY}" "Publisher" "${PRODUCT_PUBLISHER}"
@@ -187,7 +188,7 @@ Section -Post
   ${GetSize} "$INSTDIR" "/S=0K" $0 $1 $2
   IntFmt $0 "0x%08X" $0
   WriteRegDWORD SHCTX "${PRODUCT_UNINST_KEY}" "EstimatedSize" "$0"
-  WriteRegStr SHCTX "${PRODUCT_UNINST_KEY}" "Comments" "3DS emulator based on Citra"
+  WriteRegStr SHCTX "${PRODUCT_UNINST_KEY}" "Comments" "3DS emulator based on Azahar and Citra"
 SectionEnd
 
 Section Uninstall
@@ -198,7 +199,7 @@ Section Uninstall
 
   ; Be a bit careful to not delete files a user may have put into the install directory.
   Delete "$INSTDIR\*.dll"
-  Delete "$INSTDIR\azahar.exe"
+  Delete "$INSTDIR\${PRODUCT_EXE}"
   Delete "$INSTDIR\azahar-room.exe"
   Delete "$INSTDIR\qt.conf"
   Delete "$INSTDIR\uninst.exe"

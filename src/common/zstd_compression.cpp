@@ -276,7 +276,7 @@ Z3DSWriteIOFile::Z3DSWriteIOFile(std::unique_ptr<IOFile>&& underlying_file,
     impl->write_header.underlying_magic = underlying_magic;
     impl->WriteHeader(file.get());
 
-    Metadata().Add("compressor", std::string("Azahar ") + Common::g_build_fullname);
+    Metadata().Add("compressor", std::string("Denzen ") + Common::g_build_fullname);
 
     std::time_t tt = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
     std::tm tm{};

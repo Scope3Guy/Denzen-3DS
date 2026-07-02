@@ -11,7 +11,7 @@
    </rect>
   </property>
   <property name="windowTitle">
-   <string>Azahar</string>
+   <string>Denzen</string>
   </property>
   <property name="windowIcon">
    <iconset>
@@ -342,7 +342,7 @@
   </action>
   <action name="action_About">
    <property name="text">
-    <string>About Azahar</string>
+    <string>About Denzen</string>
    </property>
    <property name="menuRole">
     <enum>QAction::AboutRole</enum>
@@ -574,7 +574,7 @@
     <string>Open Log Folder</string>
    </property>
    <property name="toolTip">
-    <string>Opens the Azahar Log folder</string>
+    <string>Opens the Denzen Log folder</string>
    </property>
   </action>
   <action name="action_Screen_Layout_Default">
@@ -744,7 +744,7 @@
   </action>
   <action name="action_Open_Citra_Folder">
    <property name="text">
-    <string>Open Azahar Folder</string>
+    <string>Open Denzen Folder</string>
    </property>
   </action>
   <action name="action_Configure_Current_Game">

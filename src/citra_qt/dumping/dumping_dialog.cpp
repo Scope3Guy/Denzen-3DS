@@ -22,7 +22,7 @@ DumpingDialog::DumpingDialog(QWidget* parent, Core::System& system_)
     connect(ui->pathExplore, &QToolButton::clicked, this, &DumpingDialog::OnToolButtonClicked);
     connect(ui->buttonBox, &QDialogButtonBox::accepted, [this] {
         if (ui->pathLineEdit->text().isEmpty()) {
-            QMessageBox::critical(this, tr("Azahar"), tr("Please specify the output path."));
+            QMessageBox::critical(this, tr("Denzen"), tr("Please specify the output path."));
             return;
         }
         ApplyConfiguration();
@@ -82,7 +82,7 @@ void DumpingDialog::Populate() {
     }
 
     if (!missing.isEmpty()) {
-        QMessageBox::critical(this, tr("Azahar"),
+        QMessageBox::critical(this, tr("Denzen"),
                               tr("Could not find any available %1.\nPlease check your FFmpeg "
                                  "installation used for compilation.")
                                   .arg(missing));
