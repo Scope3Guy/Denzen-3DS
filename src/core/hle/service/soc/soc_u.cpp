@@ -1805,11 +1805,13 @@ void SOC_U::Connect(Kernel::HLERequestContext& ctx) {
         // Output
         s32 ret{};
         int connect_error;
+        bool is_nonblocking = false;
     };
 
     auto async_data = std::make_shared<AsyncData>();
     async_data->fd_info = &holder;
     async_data->pid = pid;
+    async_data->is_nonblocking = !GetSocketBlocking(holder);
 
     CTRSockAddr ctr_input_addr;
     std::memcpy(&ctr_input_addr, input_addr_buf.data(),
@@ -1828,7 +1830,15 @@ void SOC_U::Connect(Kernel::HLERequestContext& ctx) {
         },
         [async_data](Kernel::HLERequestContext& ctx) {
             if (async_data->ret != 0) {
-                async_data->ret = TranslateError(async_data->connect_error);
+#ifdef _WIN32
+                if (async_data->is_nonblocking &&
+                    async_data->connect_error == WSAEWOULDBLOCK) {
+                    async_data->ret = TranslateError(ERRNO(EINPROGRESS));
+                } else
+#endif
+                {
+                    async_data->ret = TranslateError(async_data->connect_error);
+                }
             }
 
             LOG_DEBUG(Service_SOC, "called, pid={}, fd={}, ret={}", async_data->pid,

@@ -263,6 +263,13 @@ System::ResultStatus System::RunLoop(bool tight_loop) {
                     cpu_core->Step();
                 }
             }
+
+            // A blocking SVC may have halted this core while leaving its thread recorded as
+            // current until the scheduler runs. Process the reschedule before another core can
+            // wake that thread and update its saved context; otherwise the later context switch
+            // can overwrite the wake result with the stale live CPU registers.
+            Reschedule();
+
             max_slice = cpu_core->GetTimer().GetTicks() - start_ticks;
         }
     }

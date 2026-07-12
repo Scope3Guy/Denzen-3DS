@@ -71,6 +71,7 @@ void Timer::Set(s64 initial, s64 interval) {
 
 void Timer::Cancel() {
     kernel.timing.UnscheduleEvent(timer_manager.timer_callback_event_type, callback_id);
+    signaled = false;
 }
 
 void Timer::Clear() {
