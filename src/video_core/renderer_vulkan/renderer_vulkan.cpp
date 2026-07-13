@@ -12,6 +12,7 @@
 #include "video_core/gpu.h"
 #include "video_core/pica/pica_core.h"
 #include "video_core/renderer_vulkan/renderer_vulkan.h"
+#include "video_core/renderer_vulkan/screenshot_conversion.h"
 #include "video_core/renderer_vulkan/vk_memory_util.h"
 #include "video_core/renderer_vulkan/vk_shader_util.h"
 
@@ -61,7 +62,23 @@ constexpr static std::array<vk::DescriptorSetLayoutBinding, 1> PRESENT_BINDINGS 
     {0, vk::DescriptorType::eCombinedImageSampler, 3, vk::ShaderStageFlagBits::eFragment},
 }};
 
+void ConvertScreenshotToQImageFormat(std::span<u8> pixels,
+                                     ScreenshotPixelFormat source_format) {
+    if (source_format != ScreenshotPixelFormat::Rgba8) {
+        return;
+    }
+
+    for (std::size_t offset = 0; offset + 3 < pixels.size(); offset += 4) {
+        std::swap(pixels[offset], pixels[offset + 2]);
+    }
+}
+
 namespace {
+ScreenshotPixelFormat GetScreenshotPixelFormat(vk::Format source_format) {
+    return source_format == vk::Format::eR8G8B8A8Unorm ? ScreenshotPixelFormat::Rgba8
+                                                        : ScreenshotPixelFormat::Bgra8;
+}
+
 static bool IsLowRefreshRate() {
 #if (defined(__APPLE__) || defined(ENABLE_SDL2)) && !defined(HAVE_LIBRETRO)
     if (!Settings::values.use_display_refresh_rate_detection) {
@@ -165,24 +182,33 @@ RendererVulkan::~RendererVulkan() {
 void RendererVulkan::PrepareRendertarget() {
     const auto& framebuffer_config = pica.regs.framebuffer_config;
     const auto& regs_lcd = pica.regs_lcd;
-    for (u32 i = 0; i < 3; i++) {
+    for (u32 i = 0; i < 3; ++i) {
         const u32 fb_id = i == 2 ? 1 : 0;
         const auto& framebuffer = framebuffer_config[fb_id];
-        auto& texture = screen_infos[i].texture;
+        auto& screen_info = screen_infos[i];
+        auto& texture = screen_info.texture;
 
         const auto color_fill = fb_id == 0 ? regs_lcd.color_fill_top : regs_lcd.color_fill_bottom;
-        if (color_fill.is_enabled) {
-            screen_infos[i].image_view = texture.image_view;
+        const bool is_color_fill = color_fill.is_enabled;
+        const u32 expected_width = is_color_fill ? 1 : framebuffer.width.Value();
+        const u32 expected_height = is_color_fill ? 1 : framebuffer.height.Value();
+        const Pica::PixelFormat expected_format =
+            is_color_fill ? Pica::PixelFormat::RGBA8 : framebuffer.color_format.Value();
+
+        if (!texture.image || texture.width != expected_width ||
+            texture.height != expected_height || texture.format != expected_format ||
+            texture.is_color_fill != is_color_fill) {
+            ConfigureFramebufferTexture(texture, framebuffer, is_color_fill);
+        }
+
+        if (is_color_fill) {
+            screen_info.image_view = texture.image_view;
+            screen_info.texcoords = {0.f, 0.f, 1.f, 1.f};
             FillScreen(color_fill.AsVector(), texture);
             continue;
         }
 
-        if (texture.width != framebuffer.width || texture.height != framebuffer.height ||
-            texture.format != framebuffer.color_format) {
-            ConfigureFramebufferTexture(texture, framebuffer);
-        }
-
-        LoadFBToScreenInfo(framebuffer, screen_infos[i], i == 1);
+        LoadFBToScreenInfo(framebuffer, screen_info, i == 1);
     }
 }
 
@@ -598,26 +624,38 @@ void RendererVulkan::BuildPipelines() {
 }
 
 void RendererVulkan::ConfigureFramebufferTexture(TextureInfo& texture,
-                                                 const Pica::FramebufferConfig& framebuffer) {
-    vk::Device device = instance.GetDevice();
+                                                 const Pica::FramebufferConfig& framebuffer,
+                                                 bool is_color_fill) {
+    const vk::Device device = instance.GetDevice();
+    if (texture.image) {
+        // Reconfiguration is rare, and the old image may still be referenced by queued work.
+        scheduler.Finish();
+    }
     if (texture.image_view) {
         device.destroyImageView(texture.image_view);
+        texture.image_view = vk::ImageView{nullptr};
     }
     if (texture.image) {
         vmaDestroyImage(instance.GetAllocator(), texture.image, texture.allocation);
+        texture.image = vk::Image{nullptr};
+        texture.allocation = {};
     }
 
+    const u32 width = is_color_fill ? 1 : framebuffer.width.Value();
+    const u32 height = is_color_fill ? 1 : framebuffer.height.Value();
+    const Pica::PixelFormat pica_format =
+        is_color_fill ? Pica::PixelFormat::RGBA8 : framebuffer.color_format.Value();
     const VideoCore::PixelFormat pixel_format =
-        VideoCore::PixelFormatFromGPUPixelFormat(framebuffer.color_format);
+        VideoCore::PixelFormatFromGPUPixelFormat(pica_format);
     const vk::Format format = instance.GetTraits(pixel_format).native;
     const vk::ImageCreateInfo image_info = {
         .imageType = vk::ImageType::e2D,
         .format = format,
-        .extent = {framebuffer.width, framebuffer.height, 1},
+        .extent = {width, height, 1},
         .mipLevels = 1,
         .arrayLayers = 1,
         .samples = vk::SampleCountFlagBits::e1,
-        .usage = vk::ImageUsageFlagBits::eSampled,
+        .usage = vk::ImageUsageFlagBits::eSampled | vk::ImageUsageFlagBits::eTransferDst,
     };
 
     const VmaAllocationCreateInfo alloc_info = {
@@ -632,8 +670,8 @@ void RendererVulkan::ConfigureFramebufferTexture(TextureInfo& texture,
     VkImage unsafe_image{};
     VkImageCreateInfo unsafe_image_info = static_cast<VkImageCreateInfo>(image_info);
 
-    VkResult result = vmaCreateImage(instance.GetAllocator(), &unsafe_image_info, &alloc_info,
-                                     &unsafe_image, &texture.allocation, nullptr);
+    const VkResult result = vmaCreateImage(instance.GetAllocator(), &unsafe_image_info, &alloc_info,
+                                           &unsafe_image, &texture.allocation, nullptr);
     if (result != VK_SUCCESS) [[unlikely]] {
         LOG_CRITICAL(Render_Vulkan, "Failed allocating texture with error {}", result);
         UNREACHABLE();
@@ -653,13 +691,19 @@ void RendererVulkan::ConfigureFramebufferTexture(TextureInfo& texture,
         },
     };
     texture.image_view = device.createImageView(view_info);
-
-    texture.width = framebuffer.width;
-    texture.height = framebuffer.height;
-    texture.format = framebuffer.color_format;
+    texture.width = width;
+    texture.height = height;
+    texture.format = pica_format;
+    texture.layout = vk::ImageLayout::eUndefined;
+    texture.is_color_fill = is_color_fill;
 }
 
-void RendererVulkan::FillScreen(Common::Vec3<u8> color, const TextureInfo& texture) {
+void RendererVulkan::FillScreen(Common::Vec3<u8> color, TextureInfo& texture) {
+    if (!texture.image) [[unlikely]] {
+        LOG_ERROR(Render_Vulkan, "Cannot apply LCD color fill without a framebuffer texture");
+        return;
+    }
+
     const vk::ClearColorValue clear_color = {
         .float32 =
             std::array{
@@ -669,21 +713,32 @@ void RendererVulkan::FillScreen(Common::Vec3<u8> color, const TextureInfo& textu
                 1.0f,
             },
     };
+    const vk::ImageLayout old_layout = texture.layout;
+    const bool first_use = old_layout == vk::ImageLayout::eUndefined;
+    ASSERT(first_use || old_layout == vk::ImageLayout::eGeneral);
+    const vk::PipelineStageFlags source_stage =
+        first_use ? vk::PipelineStageFlags{vk::PipelineStageFlagBits::eTopOfPipe}
+                  : vk::PipelineStageFlags{vk::PipelineStageFlagBits::eFragmentShader};
+    const vk::AccessFlags source_access =
+        first_use ? vk::AccessFlags{}
+                  : vk::AccessFlags{vk::AccessFlagBits::eShaderRead};
+    texture.layout = vk::ImageLayout::eGeneral;
 
     renderpass_cache.EndRendering();
-    scheduler.Record([image = texture.image, clear_color](vk::CommandBuffer cmdbuf) {
+    scheduler.Record([image = texture.image, clear_color, old_layout, source_stage,
+                      source_access](vk::CommandBuffer cmdbuf) {
         const vk::ImageSubresourceRange range = {
             .aspectMask = vk::ImageAspectFlagBits::eColor,
             .baseMipLevel = 0,
-            .levelCount = VK_REMAINING_MIP_LEVELS,
+            .levelCount = 1,
             .baseArrayLayer = 0,
-            .layerCount = VK_REMAINING_ARRAY_LAYERS,
+            .layerCount = 1,
         };
 
         const vk::ImageMemoryBarrier pre_barrier = {
-            .srcAccessMask = vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eTransferRead,
+            .srcAccessMask = source_access,
             .dstAccessMask = vk::AccessFlagBits::eTransferWrite,
-            .oldLayout = vk::ImageLayout::eGeneral,
+            .oldLayout = old_layout,
             .newLayout = vk::ImageLayout::eTransferDstOptimal,
             .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
             .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
@@ -693,7 +748,7 @@ void RendererVulkan::FillScreen(Common::Vec3<u8> color, const TextureInfo& textu
 
         const vk::ImageMemoryBarrier post_barrier = {
             .srcAccessMask = vk::AccessFlagBits::eTransferWrite,
-            .dstAccessMask = vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eTransferRead,
+            .dstAccessMask = vk::AccessFlagBits::eShaderRead,
             .oldLayout = vk::ImageLayout::eTransferDstOptimal,
             .newLayout = vk::ImageLayout::eGeneral,
             .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
@@ -702,12 +757,9 @@ void RendererVulkan::FillScreen(Common::Vec3<u8> color, const TextureInfo& textu
             .subresourceRange = range,
         };
 
-        cmdbuf.pipelineBarrier(vk::PipelineStageFlagBits::eFragmentShader,
-                               vk::PipelineStageFlagBits::eTransfer,
+        cmdbuf.pipelineBarrier(source_stage, vk::PipelineStageFlagBits::eTransfer,
                                vk::DependencyFlagBits::eByRegion, {}, {}, pre_barrier);
-
         cmdbuf.clearColorImage(image, vk::ImageLayout::eTransferDstOptimal, clear_color, range);
-
         cmdbuf.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
                                vk::PipelineStageFlagBits::eFragmentShader,
                                vk::DependencyFlagBits::eByRegion, {}, {}, post_barrier);
@@ -1268,6 +1320,13 @@ void RendererVulkan::RenderScreenshotWithStagingCopy() {
     // Copy backing image data to the QImage screenshot buffer
     std::memcpy(settings.screenshot_bits, alloc_info.pMappedData, staging_buffer_info.size);
 
+#ifndef HAVE_LIBRETRO
+    ConvertScreenshotToQImageFormat(
+        {static_cast<u8*>(settings.screenshot_bits),
+         static_cast<std::size_t>(width) * height * 4},
+        GetScreenshotPixelFormat(main_present_window.GetSurfaceFormat()));
+#endif
+
     // Destroy allocated resources
     vmaDestroyBuffer(instance.GetAllocator(), staging_buffer, allocation);
     vmaDestroyImage(instance.GetAllocator(), frame.image, frame.allocation);
@@ -1422,6 +1481,13 @@ bool RendererVulkan::TryRenderScreenshotWithHostMemory() {
 
     // Ensure the copy is fully completed before saving the screenshot
     scheduler.Finish();
+
+#ifndef HAVE_LIBRETRO
+    ConvertScreenshotToQImageFormat(
+        {static_cast<u8*>(settings.screenshot_bits),
+         static_cast<std::size_t>(width) * height * 4},
+        GetScreenshotPixelFormat(main_present_window.GetSurfaceFormat()));
+#endif
 
     // Image data has been copied directly to host memory
     device.destroyFramebuffer(frame.framebuffer);

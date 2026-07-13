@@ -6,6 +6,7 @@
 #include <atomic>
 #include <clocale>
 #include <iostream>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <thread>
@@ -330,10 +331,18 @@ GMainWindow::GMainWindow(Core::System& system_)
         // Enable GDB stub
         if (args[i] == QStringLiteral("--gdbport") || args[i] == QStringLiteral("-g")) {
             if (i >= args.size() - 1 || args[i + 1].startsWith(QChar::fromLatin1('-'))) {
-                continue;
+                ShowCommandOutput("Invalid GDB port", "The GDB port option requires a value.");
+                exit(1);
             }
-            Settings::values.use_gdbstub = true;
-            Settings::values.gdbstub_port = strtoul(args[++i].toLatin1(), NULL, 0);
+            bool valid_port = false;
+            const uint port = args[++i].toUInt(&valid_port, 0);
+            if (!valid_port || port == 0 || port > std::numeric_limits<u16>::max()) {
+                ShowCommandOutput("Invalid GDB port",
+                                  fmt::format("The GDB port must be between 1 and {}.",
+                                              std::numeric_limits<u16>::max()));
+                exit(1);
+            }
+            gdb_port_override = static_cast<u16>(port);
             continue;
         }
 
@@ -1547,6 +1556,13 @@ void GMainWindow::BootGame(const QString& filename) {
     // possible. Instead register the app loader early and do not create it again on system load.
     if (loader && !loader->SupportsMultipleInstancesForSameFile()) {
         system.RegisterAppLoaderEarly(loader);
+    }
+
+    // Override GDB settings if emulator was launched with
+    // GDB port option.
+    if (gdb_port_override) {
+        system.SetGDBPortOverride(*gdb_port_override);
+        system.SetDebugNextProcessFlag();
     }
 
     system.ApplySettings();
@@ -3461,18 +3477,28 @@ void GMainWindow::OnCaptureScreenshot() {
         if (was_running) {
             OnPauseGame();
         }
-        std::string path = UISettings::values.screenshot_path.GetValue();
-        if (!FileUtil::IsDirectory(path)) {
-            if (!FileUtil::CreateFullPath(path)) {
-                QMessageBox::information(
+        std::string path = UISettings::NormalizeScreenshotPath(
+            UISettings::values.screenshot_path.GetValue());
+        const auto ensure_screenshot_directory = [](const std::string& directory) {
+            return FileUtil::IsDirectory(directory) ||
+                   FileUtil::CreateFullPath(directory + "/");
+        };
+        if (!ensure_screenshot_directory(path)) {
+            QMessageBox::information(
+                this, tr("Invalid Screenshot Directory"),
+                tr("Cannot create specified screenshot directory. Screenshot "
+                   "path is set back to its default value."));
+            path = UISettings::NormalizeScreenshotPath({});
+            if (!ensure_screenshot_directory(path)) {
+                QMessageBox::critical(
                     this, tr("Invalid Screenshot Directory"),
-                    tr("Cannot create specified screenshot directory. Screenshot "
-                       "path is set back to its default value."));
-                path = FileUtil::GetUserPath(FileUtil::UserPath::UserDir);
-                path.append("screenshots/");
-                UISettings::values.screenshot_path = path;
-            };
+                    tr("Cannot create the default screenshot directory. The screenshot "
+                       "was not saved."));
+                OnResumeGame(false);
+                return;
+            }
         }
+        UISettings::values.screenshot_path = path;
 
         static QRegularExpression expr(QStringLiteral("[\\/:?\"<>|]"));
         const std::string filename = game_title.remove(expr).toStdString();

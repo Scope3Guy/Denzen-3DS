@@ -158,6 +158,7 @@ endif()
 if (ENABLE_VULKAN)
     target_sources(video_core PRIVATE
         renderer_vulkan/pica_to_vk.h
+        renderer_vulkan/screenshot_conversion.h
         renderer_vulkan/renderer_vulkan.cpp
         renderer_vulkan/renderer_vulkan.h
         renderer_vulkan/vk_blit_helper.cpp

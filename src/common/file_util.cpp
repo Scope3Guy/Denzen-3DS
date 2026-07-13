@@ -10,7 +10,9 @@
 #include <fstream>
 #include <limits>
 #include <memory>
+#include <optional>
 #include <sstream>
+#include <stdexcept>
 #include <unordered_map>
 #include <boost/iostreams/device/file_descriptor.hpp>
 #include <boost/iostreams/stream.hpp>
@@ -863,13 +865,35 @@ const std::string& GetExeDirectory() {
     return exe_path;
 }
 
-std::string AppDataRoamingDirectory() {
-    PWSTR pw_local_path = nullptr;
-    // Only supported by Windows Vista or later
-    SHGetKnownFolderPath(FOLDERID_RoamingAppData, 0, nullptr, &pw_local_path);
-    std::string local_path = Common::UTF16ToUTF8(pw_local_path);
-    CoTaskMemFree(pw_local_path);
-    return local_path;
+std::optional<std::string> AppDataRoamingDirectory() {
+    PWSTR raw_path = nullptr;
+    const HRESULT hr =
+        SHGetKnownFolderPath(FOLDERID_RoamingAppData, KF_FLAG_DEFAULT, nullptr, &raw_path);
+    const std::unique_ptr<wchar_t, decltype(&CoTaskMemFree)> path{raw_path, CoTaskMemFree};
+
+    if (SUCCEEDED(hr) && path) {
+        return Common::UTF16ToUTF8(path.get());
+    }
+
+    const DWORD required_size = GetEnvironmentVariableW(L"APPDATA", nullptr, 0);
+    if (required_size != 0) {
+        std::wstring fallback(required_size, L'\0');
+        const DWORD written =
+            GetEnvironmentVariableW(L"APPDATA", fallback.data(), required_size);
+        if (written != 0 && written < required_size) {
+            fallback.resize(written);
+            LOG_ERROR(Common_Filesystem,
+                      "SHGetKnownFolderPath failed with HRESULT 0x{:08X}; using APPDATA fallback",
+                      static_cast<u32>(hr));
+            return Common::UTF16ToUTF8(fallback);
+        }
+    }
+
+    LOG_CRITICAL(Common_Filesystem,
+                 "Could not determine the Windows roaming AppData directory (HRESULT 0x{:08X}, "
+                 "Win32 error {})",
+                 static_cast<u32>(hr), GetLastError());
+    return std::nullopt;
 }
 #else
 /**
@@ -943,11 +967,19 @@ void SetUserPath(const std::string& path) {
         std::string& legacy_lime3ds_user_path = g_paths[UserPath::LegacyLime3DSUserDir];
 
         if (!FileUtil::IsDirectory(user_path)) {
-            user_path = AppDataRoamingDirectory() + DIR_SEP EMU_DATA_DIR DIR_SEP;
-            legacy_citra_user_path =
-                AppDataRoamingDirectory() + DIR_SEP LEGACY_CITRA_DATA_DIR DIR_SEP;
-            legacy_lime3ds_user_path =
-                AppDataRoamingDirectory() + DIR_SEP LEGACY_LIME3DS_DATA_DIR DIR_SEP;
+            const auto app_data = AppDataRoamingDirectory();
+            if (app_data) {
+                user_path = *app_data + DIR_SEP EMU_DATA_DIR DIR_SEP;
+                legacy_citra_user_path = *app_data + DIR_SEP LEGACY_CITRA_DATA_DIR DIR_SEP;
+                legacy_lime3ds_user_path = *app_data + DIR_SEP LEGACY_LIME3DS_DATA_DIR DIR_SEP;
+            } else if (!CreateFullPath(user_path)) {
+                LOG_CRITICAL(Common_Filesystem,
+                             "The roaming AppData and local user directories are unavailable");
+                throw std::runtime_error("No writable Denzen user directory is available");
+            } else {
+                LOG_WARNING(Common_Filesystem,
+                            "Using the local user directory because AppData is unavailable");
+            }
         } else {
             LOG_INFO(Common_Filesystem, "Using the local user directory");
         }

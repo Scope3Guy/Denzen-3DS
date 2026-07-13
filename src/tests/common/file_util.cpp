@@ -25,6 +25,13 @@ TEST_CASE("SplitFilename83 Sanity", "[common]") {
     REQUIRE(std::memcmp(extension.data(), expected_extension.data(), extension.size()) == 0);
 }
 
+TEST_CASE("SanitizePath handles mixed directory separators", "[common][file_util]") {
+    const std::string mixed = R"(C:\Users\test/AppData\Roaming/Denzen\screenshots/)";
+    const std::string expected = "C:/Users/test/AppData/Roaming/Denzen/screenshots";
+
+    REQUIRE(FileUtil::SanitizePath(mixed) == expected);
+}
+
 #if defined(__APPLE__)
 
 TEST_CASE("NormalizeNFDToNFC Sanity", "[common]") {

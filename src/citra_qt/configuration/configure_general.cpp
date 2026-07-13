@@ -140,12 +140,12 @@ void ConfigureGeneral::SetConfiguration() {
 
     UISettings::values.screenshot_path.SetGlobal(ui->screenshot_combo->currentIndex() ==
                                                  ConfigurationShared::USE_GLOBAL_INDEX);
-    std::string screenshot_path = UISettings::values.screenshot_path.GetValue();
-    if (screenshot_path.empty()) {
-        screenshot_path = FileUtil::GetUserPath(FileUtil::UserPath::UserDir) + "screenshots/";
-        FileUtil::CreateFullPath(screenshot_path);
-        UISettings::values.screenshot_path = screenshot_path;
+    const std::string configured_path = UISettings::values.screenshot_path.GetValue();
+    const std::string screenshot_path = UISettings::NormalizeScreenshotPath(configured_path);
+    if (configured_path.empty()) {
+        FileUtil::CreateFullPath(screenshot_path + "/");
     }
+    UISettings::values.screenshot_path = screenshot_path;
     ui->screenshot_dir_path->setText(QString::fromStdString(screenshot_path));
 }
 

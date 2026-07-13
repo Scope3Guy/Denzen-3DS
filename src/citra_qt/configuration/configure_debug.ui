@@ -54,7 +54,7 @@
           <item>
            <widget class="QSpinBox" name="gdbport_spinbox">
             <property name="maximum">
-             <number>65536</number>
+             <number>65535</number>
             </property>
            </widget>
           </item>

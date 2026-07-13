@@ -30,6 +30,7 @@ union ClearValue {
 
 struct TextureClear {
     u32 texture_level;
+    u32 texture_layer{};
     Common::Rectangle<u32> texture_rect;
     ClearValue value;
 };

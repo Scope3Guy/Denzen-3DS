@@ -8,6 +8,7 @@
 #include <chrono>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <boost/optional.hpp>
 #include <boost/serialization/version.hpp>
@@ -421,6 +422,10 @@ public:
 
     void DebugUnscheduleAllThreadsFromFrontend(bool unschedule);
 
+    void SetGDBPortOverride(u16 port) {
+        override_gdb_port = port;
+    }
+
 private:
     /**
      * Initialize the emulated system.
@@ -530,7 +535,8 @@ private:
     Common::Vec3<u8> info_led_color;
     std::function<void()> info_led_color_changed;
 
-    bool debug_next_process;
+    bool debug_next_process{};
+    std::optional<u16> override_gdb_port;
 
     friend class boost::serialization::access;
     template <typename Archive>

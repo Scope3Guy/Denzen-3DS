@@ -40,12 +40,14 @@ class GPU;
 namespace Vulkan {
 
 struct TextureInfo {
-    u32 width;
-    u32 height;
-    Pica::PixelFormat format;
-    vk::Image image;
-    vk::ImageView image_view;
-    VmaAllocation allocation;
+    u32 width{};
+    u32 height{};
+    Pica::PixelFormat format{};
+    vk::Image image{};
+    vk::ImageView image_view{};
+    VmaAllocation allocation{};
+    vk::ImageLayout layout{vk::ImageLayout::eUndefined};
+    bool is_color_fill{};
 };
 
 struct ScreenInfo {
@@ -89,7 +91,8 @@ private:
     void BuildLayouts();
     void BuildPipelines();
     void ConfigureFramebufferTexture(TextureInfo& texture,
-                                     const Pica::FramebufferConfig& framebuffer);
+                                     const Pica::FramebufferConfig& framebuffer,
+                                     bool is_color_fill);
     void ConfigureRenderPipeline();
     void PrepareRendertarget();
     void RenderScreenshot();
@@ -116,7 +119,7 @@ private:
 
     void LoadFBToScreenInfo(const Pica::FramebufferConfig& framebuffer, ScreenInfo& screen_info,
                             bool right_eye);
-    void FillScreen(Common::Vec3<u8> color, const TextureInfo& texture);
+    void FillScreen(Common::Vec3<u8> color, TextureInfo& texture);
 
 private:
     Memory::MemorySystem& memory;

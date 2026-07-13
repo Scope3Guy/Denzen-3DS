@@ -6,6 +6,7 @@
 
 #include <array>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 #include <QByteArray>
@@ -164,6 +165,8 @@ struct Values {
 
     bool shortcut_already_warned = false;
 };
+
+[[nodiscard]] std::string NormalizeScreenshotPath(std::string_view path);
 
 extern Values values;
 } // namespace UISettings

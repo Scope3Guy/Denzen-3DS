@@ -409,6 +409,8 @@ private:
     // Whether game was paused due to stopping video dumping
     bool game_paused_for_dumping = false;
 
+    std::optional<u16> gdb_port_override;
+
     QString gl_renderer;
     std::vector<QString> physical_devices;
 

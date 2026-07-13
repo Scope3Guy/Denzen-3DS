@@ -769,8 +769,13 @@ void System::Reset() {
 
 void System::ApplySettings() {
 #ifdef ENABLE_GDBSTUB
-    GDBStub::SetServerPort(Settings::values.gdbstub_port.GetValue());
-    GDBStub::ToggleServer(Settings::values.use_gdbstub.GetValue());
+    if (override_gdb_port) {
+        GDBStub::SetServerPort(*override_gdb_port);
+        GDBStub::ToggleServer(true);
+    } else {
+        GDBStub::SetServerPort(Settings::values.gdbstub_port.GetValue());
+        GDBStub::ToggleServer(Settings::values.use_gdbstub.GetValue());
+    }
 #endif
 
     if (gpu) {

@@ -47,6 +47,7 @@ void Module::serialize(Archive& ar, const unsigned int) {
     ar & cfg_config_file_buffer;
     ar & cfg_system_save_data_archive;
     ar & mac_address;
+    ar & load_savegame_res.raw;
     ar & preferred_region_code;
     ar & preferred_region_chosen;
 }
@@ -81,6 +82,35 @@ struct SaveFileConfig {
 };
 static_assert(sizeof(SaveFileConfig) == 0x455C,
               "SaveFileConfig header must be exactly 0x455C bytes");
+
+constexpr Result ResultInvalidConfigSave(ErrorDescription::InvalidSize, ErrorModule::Config,
+                                         ErrorSummary::InvalidState, ErrorLevel::Permanent);
+
+bool IsConfigSaveValid(std::span<const u8> data) {
+    if (data.size() < sizeof(SaveFileConfig)) {
+        return false;
+    }
+
+    const auto* config = reinterpret_cast<const SaveFileConfig*>(data.data());
+    if (config->total_entries > CONFIG_FILE_MAX_BLOCK_ENTRIES ||
+        config->data_entries_offset != sizeof(SaveFileConfig)) {
+        return false;
+    }
+
+    for (u32 i = 0; i < config->total_entries; ++i) {
+        const auto& entry = config->block_entries[i];
+        if (entry.size <= sizeof(entry.offset_or_data)) {
+            continue;
+        }
+
+        const u64 block_end = static_cast<u64>(entry.offset_or_data) + entry.size;
+        if (entry.offset_or_data < config->data_entries_offset || block_end > data.size()) {
+            return false;
+        }
+    }
+
+    return true;
+}
 
 } // namespace
 
@@ -802,6 +832,10 @@ ResultVal<void*> Module::GetConfigBlockPointer(u32 block_id, u32 size, AccessFla
 }
 
 Result Module::GetConfigBlock(u32 block_id, u32 size, AccessFlag accesss_flag, void* output) {
+    if (load_savegame_res.IsError()) {
+        return load_savegame_res;
+    }
+
     bool get_from_artic =
         block_id == ConsoleUniqueID2BlockID &&
         (static_cast<u16>(accesss_flag) & static_cast<u16>(AccessFlag::UserRead)) != 0;
@@ -841,6 +875,10 @@ Result Module::GetConfigBlock(u32 block_id, u32 size, AccessFlag accesss_flag, v
 }
 
 Result Module::SetConfigBlock(u32 block_id, u32 size, AccessFlag accesss_flag, const void* input) {
+    if (load_savegame_res.IsError()) {
+        return load_savegame_res;
+    }
+
     void* pointer = nullptr;
     CASCADE_RESULT(pointer, GetConfigBlockPointer(block_id, size, accesss_flag));
     std::memcpy(pointer, input, size);
@@ -849,6 +887,10 @@ Result Module::SetConfigBlock(u32 block_id, u32 size, AccessFlag accesss_flag, c
 
 Result Module::CreateConfigBlock(u32 block_id, u16 size, AccessFlag access_flags,
                                  const void* data) {
+    if (load_savegame_res.IsError()) {
+        return load_savegame_res;
+    }
+
     SaveFileConfig* config = reinterpret_cast<SaveFileConfig*>(cfg_config_file_buffer.data());
     if (config->total_entries >= CONFIG_FILE_MAX_BLOCK_ENTRIES)
         return ResultUnknown; // TODO(Subv): Find the right error code
@@ -881,11 +923,19 @@ Result Module::CreateConfigBlock(u32 block_id, u16 size, AccessFlag access_flags
 }
 
 Result Module::DeleteConfigNANDSaveFile() {
+    if (load_savegame_res.IsError()) {
+        return load_savegame_res;
+    }
+
     FileSys::Path path("/config");
     return cfg_system_save_data_archive->DeleteFile(path);
 }
 
 Result Module::UpdateConfigNANDSavegame() {
+    if (load_savegame_res.IsError()) {
+        return load_savegame_res;
+    }
+
     LOG_DEBUG(Service_CFG, "Saving config file to NAND");
 
     FileSys::Mode mode = {};
@@ -893,17 +943,35 @@ Result Module::UpdateConfigNANDSavegame() {
     mode.create_flag.Assign(1);
 
     FileSys::Path path("/config");
-
     auto config_result = cfg_system_save_data_archive->OpenFile(path, mode);
-    ASSERT_MSG(config_result.Succeeded(), "could not open file");
+    if (config_result.Failed()) {
+        LOG_ERROR(Service_CFG, "Could not open the CFG save file for writing: 0x{:08X}",
+                  config_result.Code().raw);
+        return config_result.Code();
+    }
 
     auto config = std::move(config_result).Unwrap();
-    config->Write(0, CONFIG_SAVEFILE_SIZE, true, false, cfg_config_file_buffer.data());
+    auto write_result =
+        config->Write(0, CONFIG_SAVEFILE_SIZE, true, false, cfg_config_file_buffer.data());
+    if (write_result.Failed()) {
+        LOG_ERROR(Service_CFG, "Could not write the CFG save file: 0x{:08X}",
+                  write_result.Code().raw);
+        return write_result.Code();
+    }
+    if (*write_result != CONFIG_SAVEFILE_SIZE) {
+        LOG_ERROR(Service_CFG, "Incomplete CFG save write: expected {} bytes, wrote {}",
+                  CONFIG_SAVEFILE_SIZE, *write_result);
+        return ResultInvalidConfigSave;
+    }
 
     return ResultSuccess;
 }
 
 Result Module::FormatConfig() {
+    if (load_savegame_res.IsError()) {
+        return load_savegame_res;
+    }
+
     Result res = DeleteConfigNANDSaveFile();
     // The delete command fails if the file doesn't exist, so we have to check that too
     if (!res.IsSuccess() && res != FileSys::ResultFileNotFound) {
@@ -942,6 +1010,8 @@ Result Module::FormatConfig() {
 Result Module::LoadConfigNANDSaveFile() {
     LOG_DEBUG(Service_CFG, "Loading config file from NAND");
 
+    cfg_system_save_data_archive.reset();
+
     const std::string& nand_directory = FileUtil::GetUserPath(FileUtil::UserPath::NANDDir);
     FileSys::ArchiveFactory_SystemSaveData systemsavedata_factory(nand_directory);
 
@@ -952,12 +1022,29 @@ Result Module::LoadConfigNANDSaveFile() {
     // If the archive didn't exist, create the files inside
     if (archive_result.Code() == FileSys::ResultNotFound) {
         // Format the archive to create the directories
-        systemsavedata_factory.Format(archive_path, FileSys::ArchiveFormatInfo(), 0, 0, 0);
+        auto format_result =
+            systemsavedata_factory.Format(archive_path, FileSys::ArchiveFormatInfo(), 0, 0, 0);
+
+        if (!format_result.IsSuccess()) {
+            LOG_ERROR(Service_CFG, "Could not format the CFG SystemSaveData archive!");
+            return format_result;
+        }
 
         // Open it again to get a valid archive now that the folder exists
-        cfg_system_save_data_archive = systemsavedata_factory.Open(archive_path, 0).Unwrap();
+        auto new_archive_result = systemsavedata_factory.Open(archive_path, 0);
+
+        if (!new_archive_result.Succeeded()) {
+            LOG_ERROR(Service_CFG, "Could not open the CFG SystemSaveData archive!");
+            return new_archive_result.Code();
+        }
+
+        cfg_system_save_data_archive = std::move(new_archive_result).Unwrap();
+
     } else {
-        ASSERT_MSG(archive_result.Succeeded(), "Could not open the CFG SystemSaveData archive!");
+        if (!archive_result.Succeeded()) {
+            LOG_ERROR(Service_CFG, "Could not open the CFG SystemSaveData archive!");
+            return archive_result.Code();
+        }
 
         cfg_system_save_data_archive = std::move(archive_result).Unwrap();
     }
@@ -967,15 +1054,28 @@ Result Module::LoadConfigNANDSaveFile() {
     open_mode.read_flag.Assign(1);
 
     auto config_result = cfg_system_save_data_archive->OpenFile(config_path, open_mode);
-
-    // Read the file if it already exists
-    if (config_result.Succeeded()) {
-        auto config = std::move(config_result).Unwrap();
-        config->Read(0, CONFIG_SAVEFILE_SIZE, cfg_config_file_buffer.data());
-        return ResultSuccess;
+    if (config_result.Failed()) {
+        if (config_result.Code() == FileSys::ResultFileNotFound) {
+            return FormatConfig();
+        }
+        LOG_ERROR(Service_CFG, "Could not open the CFG save file: 0x{:08X}",
+                  config_result.Code().raw);
+        return config_result.Code();
     }
 
-    return FormatConfig();
+    auto config = std::move(config_result).Unwrap();
+    auto read_result = config->Read(0, CONFIG_SAVEFILE_SIZE, cfg_config_file_buffer.data());
+    if (read_result.Failed()) {
+        LOG_ERROR(Service_CFG, "Could not read the CFG save file: 0x{:08X}",
+                  read_result.Code().raw);
+        return read_result.Code();
+    }
+    if (*read_result != CONFIG_SAVEFILE_SIZE || !IsConfigSaveValid(cfg_config_file_buffer)) {
+        LOG_ERROR(Service_CFG, "CFG save file is incomplete or structurally invalid");
+        return ResultInvalidConfigSave;
+    }
+
+    return ResultSuccess;
 }
 
 void Module::LoadMCUConfig() {
@@ -1003,9 +1103,14 @@ void Module::SaveMCUConfig() {
 }
 
 Module::Module(Core::System& system_) : system(system_) {
-    LoadConfigNANDSaveFile();
+    load_savegame_res = LoadConfigNANDSaveFile();
     LoadMCUConfig();
     (void)GetMacAddress();
+    if (load_savegame_res.IsError()) {
+        LOG_ERROR(Service_CFG, "CFG save data is unavailable: 0x{:08X}", load_savegame_res.raw);
+        return;
+    }
+
     // Check the config savegame EULA Version and update it to 0x7F7F if necessary
     // so users will never get a prompt to accept EULA
     auto version = GetEULAVersion();
@@ -1014,7 +1119,11 @@ Module::Module(Core::System& system_) : system(system_) {
         LOG_INFO(Service_CFG, "Updating accepted EULA version to {}.{}", default_version.major,
                  default_version.minor);
         SetEULAVersion(default_version);
-        UpdateConfigNANDSavegame();
+        const Result update_result = UpdateConfigNANDSavegame();
+        if (update_result.IsError()) {
+            LOG_ERROR(Service_CFG, "Could not persist the accepted EULA version: 0x{:08X}",
+                      update_result.raw);
+        }
     }
 }
 
@@ -1132,7 +1241,7 @@ void Module::SetUsername(const std::u16string& name) {
 }
 
 std::u16string Module::GetUsername() {
-    UsernameBlock block;
+    UsernameBlock block{};
     GetConfigBlock(UsernameBlockID, sizeof(block), AccessFlag::SystemRead, &block);
 
     // the username string in the block isn't null-terminated,
@@ -1150,7 +1259,7 @@ void Module::SetBirthday(u8 month, u8 day) {
 }
 
 std::tuple<u8, u8> Module::GetBirthday() {
-    BirthdayBlock block;
+    BirthdayBlock block{};
     GetConfigBlock(BirthdayBlockID, sizeof(block), AccessFlag::SystemRead, &block);
     return std::make_tuple(block.month, block.day);
 }
