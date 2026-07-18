@@ -1062,7 +1062,7 @@ void GSP_GPU::ReleaseRight(SessionData* session_data) {
 void GSP_GPU::ReleaseRight(Kernel::HLERequestContext& ctx) {
     IPC::RequestParser rp(ctx);
 
-    const SessionData* session_data = GetSessionData(ctx.Session());
+    SessionData* session_data = GetSessionData(ctx.Session());
     // Success even if wrong thread calls this function.
     ReleaseRight(session_data);
 
