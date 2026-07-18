@@ -7,6 +7,7 @@
 #include <boost/serialization/base_object.hpp>
 #include <boost/serialization/optional.hpp>
 #include <boost/serialization/shared_ptr.hpp>
+#include <boost/serialization/vector.hpp>
 #include "common/archives.h"
 #include "common/bit_field.h"
 #include "common/hacks/hack_manager.h"
@@ -39,10 +40,15 @@ namespace ErrCodes {
 enum {
     // TODO(purpasmart): Check if this name fits its actual usage
     OutofRangeOrMisalignedAddress = 513,
+    NoSaveVRAMSysAreaPerm = 518,
     FirstInitialization = 519,
 };
 }
 
+constexpr Result ResultNoSaveVRAMSysAreaPerm(ErrCodes::NoSaveVRAMSysAreaPerm, ErrorModule::GX,
+                                             ErrorSummary::NothingHappened, ErrorLevel::Permanent);
+constexpr Result ResultVramOperationBusy(ErrorDescription::Busy, ErrorModule::GX,
+                                         ErrorSummary::WouldBlock, ErrorLevel::Status);
 constexpr Result ResultFirstInitialization(ErrCodes::FirstInitialization, ErrorModule::GX,
                                            ErrorSummary::Success, ErrorLevel::Success);
 constexpr Result ResultRegsOutOfRangeOrMisaligned(ErrCodes::OutofRangeOrMisalignedAddress,
@@ -71,13 +77,25 @@ CommandBuffer* GSP_GPU::GetCommandBuffer(u32 thread_id) {
     return reinterpret_cast<CommandBuffer*>(ptr);
 }
 
-FrameBufferUpdate* GSP_GPU::GetFrameBufferInfo(u32 thread_id, u32 screen_index) {
+FrameBufferStateCache::UpdateResult GSP_GPU::GetFrameBufferInfo(u32 thread_id, u32 screen_index,
+                                                                bool force_update) {
     DEBUG_ASSERT_MSG(screen_index < 2, "Invalid screen index");
 
-    // For each thread there are two FrameBufferUpdate fields
-    const u32 offset = 0x200 + (2 * thread_id + screen_index) * sizeof(FrameBufferUpdate);
-    u8* ptr = shared_memory->GetPointer(offset);
-    return reinterpret_cast<FrameBufferUpdate*>(ptr);
+    FrameBufferUpdate* shared_update = nullptr;
+    if (thread_id < MaxGSPThreads) {
+        const u32 offset = 0x200 + (2 * thread_id + screen_index) * sizeof(FrameBufferUpdate);
+        shared_update = reinterpret_cast<FrameBufferUpdate*>(shared_memory->GetPointer(offset));
+    }
+
+    return framebuffer_cache.Access(screen_index, shared_update, force_update);
+}
+
+static void FinishPendingVBlankWait(SessionData* session_data) {
+    auto pending_event = std::move(session_data->on_vblank_event);
+    session_data->on_vblank_event.reset();
+    if (pending_event) {
+        pending_event->Signal();
+    }
 }
 
 InterruptRelayQueue* GSP_GPU::GetInterruptRelayQueue(u32 thread_id) {
@@ -86,10 +104,20 @@ InterruptRelayQueue* GSP_GPU::GetInterruptRelayQueue(u32 thread_id) {
 }
 
 void GSP_GPU::ClientDisconnected(std::shared_ptr<Kernel::ServerSession> server_session) {
-    const SessionData* session_data = GetSessionData(server_session);
-    if (active_thread_id == session_data->thread_id) {
+    SessionData* session_data = GetSessionData(server_session);
+
+    FinishPendingVBlankWait(session_data);
+    session_data->interrupt_event.reset();
+    session_data->registered = false;
+
+    if (thread_id_with_rights == session_data->thread_id) {
         ReleaseRight(session_data);
+    } else if (vram_backup_handler.IsOwnedBy(session_data->thread_id)) {
+        vram_backup_handler.ResetState();
+        legacy_saved_vram.reset();
     }
+
+    session_data->relay_queue_flags = {};
     SessionRequestHandler::ClientDisconnected(server_session);
 }
 
@@ -189,6 +217,38 @@ static Result WriteHWRegsWithMask(u32 base_address, u32 size_in_bytes, std::span
 
     return ResultSuccess;
 }
+
+class GSP_GPU::ThreadCallback : public Kernel::HLERequestContext::WakeupCallback {
+public:
+    enum class Type : u32 {
+        SaveVRAMSysArea,
+        RestoreVRAMSysArea,
+    };
+
+    explicit ThreadCallback(Type type_) : type(type_) {}
+
+    void WakeUp(std::shared_ptr<Kernel::Thread> thread, Kernel::HLERequestContext& ctx,
+                Kernel::ThreadWakeupReason reason) override {
+        if (reason != Kernel::ThreadWakeupReason::Signal) {
+            LOG_WARNING(Service_GSP, "VRAM operation woke without a VBlank signal");
+        }
+
+        IPC::RequestBuilder rb(ctx, 1, 0);
+        rb.Push(ResultSuccess);
+    }
+
+private:
+    Type type{Type::SaveVRAMSysArea};
+
+    ThreadCallback() = default;
+
+    template <class Archive>
+    void serialize(Archive& ar, const unsigned int) {
+        ar& boost::serialization::base_object<Kernel::HLERequestContext::WakeupCallback>(*this);
+        ar & type;
+    }
+    friend class boost::serialization::access;
+};
 
 void GSP_GPU::WriteHWRegs(Kernel::HLERequestContext& ctx) {
     IPC::RequestParser rp(ctx);
@@ -315,7 +375,8 @@ void GSP_GPU::GetPerfLog(Kernel::HLERequestContext& ctx) {
 
 void GSP_GPU::RegisterInterruptRelayQueue(Kernel::HLERequestContext& ctx) {
     IPC::RequestParser rp(ctx);
-    u32 flags = rp.Pop<u32>();
+
+    auto relay_queue_flags = static_cast<RelayEventQueueFlags>(rp.Pop<u32>());
 
     auto interrupt_event = rp.PopObject<Kernel::Event>();
     ASSERT_MSG(interrupt_event, "handle is not valid!");
@@ -323,8 +384,18 @@ void GSP_GPU::RegisterInterruptRelayQueue(Kernel::HLERequestContext& ctx) {
     interrupt_event->SetName("GSP_GPU::interrupt_event");
 
     SessionData* session_data = GetSessionData(ctx.Session());
+    const bool permission_removed =
+        True(session_data->relay_queue_flags & RelayEventQueueFlags::AllowSaveVramSysArea) &&
+        False(relay_queue_flags & RelayEventQueueFlags::AllowSaveVramSysArea);
+    if (permission_removed && vram_backup_handler.IsOwnedBy(session_data->thread_id)) {
+        FinishPendingVBlankWait(session_data);
+        vram_backup_handler.ResetState();
+        legacy_saved_vram.reset();
+    }
+
     session_data->interrupt_event = std::move(interrupt_event);
     session_data->registered = true;
+    session_data->relay_queue_flags = relay_queue_flags;
 
     IPC::RequestBuilder rb = rp.MakeBuilder(2, 2);
 
@@ -339,15 +410,25 @@ void GSP_GPU::RegisterInterruptRelayQueue(Kernel::HLERequestContext& ctx) {
     rb.Push(session_data->thread_id);
     rb.PushCopyObjects(shared_memory);
 
-    LOG_DEBUG(Service_GSP, "called, flags=0x{:08X}", flags);
+    LOG_DEBUG(Service_GSP, "called, relay_queue_flags=0x{:08X}", relay_queue_flags);
 }
 
 void GSP_GPU::UnregisterInterruptRelayQueue(Kernel::HLERequestContext& ctx) {
     IPC::RequestParser rp(ctx);
 
     SessionData* session_data = GetSessionData(ctx.Session());
-    session_data->interrupt_event = nullptr;
+    const bool retires_backup = thread_id_with_rights == session_data->thread_id ||
+                                vram_backup_handler.IsOwnedBy(session_data->thread_id);
+
+    FinishPendingVBlankWait(session_data);
+    session_data->interrupt_event.reset();
     session_data->registered = false;
+    session_data->relay_queue_flags = {};
+
+    if (retires_backup) {
+        vram_backup_handler.ResetState();
+        legacy_saved_vram.reset();
+    }
 
     IPC::RequestBuilder rb = rp.MakeBuilder(1, 0);
     rb.Push(ResultSuccess);
@@ -494,18 +575,14 @@ void Service::GSP::GSP_GPU::ProcessPendingInterruptImpl(InterruptId interrupt_id
             u8 next = interrupt_relay_queue->index;
             next += interrupt_relay_queue->number_interrupts;
             next %= InterruptRelayQueue::max_slots;
-
             interrupt_relay_queue->number_interrupts += 1;
-
             interrupt_relay_queue->slot[next] = interrupt_id;
-
             interrupt_event->Signal();
         }
     };
 
     if (is_pdc) {
         if (!interrupt_relay_queue->ignore_pdc.Value()) {
-
             if (interrupt_relay_queue->number_interrupts >=
                 InterruptRelayQueue::stop_queuing_pdc_threeshold) {
                 if (interrupt_id == InterruptId::PDC0) {
@@ -518,15 +595,21 @@ void Service::GSP::GSP_GPU::ProcessPendingInterruptImpl(InterruptId interrupt_id
             }
         }
 
-        // Update framebuffer information if requested
-        const s32 screen_id = (interrupt_id == InterruptId::PDC0) ? 0 : 1;
-
-        auto* info = GetFrameBufferInfo(thread_id, screen_id);
-        if (info->is_dirty) {
-            system.GPU().SetBufferSwap(screen_id, info->framebuffer_info[info->index]);
-            info->is_dirty.Assign(false);
+        const u32 screen_id = interrupt_id == InterruptId::PDC0 ? 0 : 1;
+        const auto framebuffer = GetFrameBufferInfo(thread_id, screen_id);
+        if (framebuffer.updated || force_buffer_swap[screen_id]) {
+            force_buffer_swap[screen_id] = false;
+            if (framebuffer.info) {
+                system.GPU().SetBufferSwap(screen_id, *framebuffer.info);
+            } else {
+                LOG_WARNING(Service_GSP,
+                            "Framebuffer swap requested without valid cached screen state");
+            }
         }
 
+        if (interrupt_id == InterruptId::PDC1) {
+            FinishPendingVBlankWait(session_data);
+        }
     } else {
         queue_interrupt();
     }
@@ -549,11 +632,11 @@ void GSP_GPU::SignalInterrupt(InterruptId interrupt_id, u64 wait_delay_ns) {
     }
 
     // For normal interrupts, don't do anything if no process has acquired the GPU right.
-    if (active_thread_id == std::numeric_limits<u32>::max()) {
+    if (thread_id_with_rights == std::numeric_limits<u32>::max()) {
         return;
     }
 
-    SignalInterruptForThread(interrupt_id, active_thread_id, wait_delay_ns);
+    SignalInterruptForThread(interrupt_id, thread_id_with_rights, wait_delay_ns);
 }
 
 void GSP_GPU::SetLcdForceBlack(Kernel::HLERequestContext& ctx) {
@@ -571,7 +654,14 @@ void GSP_GPU::SetLcdForceBlack(Kernel::HLERequestContext& ctx) {
 void GSP_GPU::TriggerCmdReqQueue(Kernel::HLERequestContext& ctx) {
     IPC::RequestParser rp(ctx);
 
-    auto* command_buffer = GetCommandBuffer(active_thread_id);
+    if (thread_id_with_rights == std::numeric_limits<u32>::max()) {
+        // Hardware treats this request as a successful no-op when no session owns GPU rights.
+        IPC::RequestBuilder rb = rp.MakeBuilder(1, 0);
+        rb.Push(ResultSuccess);
+        return;
+    }
+
+    auto* command_buffer = GetCommandBuffer(thread_id_with_rights);
     auto& gpu = system.GPU();
 
     bool requires_delay = false;
@@ -628,17 +718,15 @@ void GSP_GPU::ImportDisplayCaptureInfo(Kernel::HLERequestContext& ctx) {
 
     LOG_DEBUG(Service_GSP, "called");
 
-    if (active_thread_id == std::numeric_limits<u32>::max()) {
-        LOG_WARNING(Service_GSP, "Called without an active thread.");
+    const auto top_screen = GetFrameBufferInfo(thread_id_with_rights, 0);
+    const auto bottom_screen = GetFrameBufferInfo(thread_id_with_rights, 1);
 
-        // TODO: Find the right error code.
-        IPC::RequestBuilder rb = rp.MakeBuilder(1, 0);
-        rb.Push(-1);
-        return;
+    if (top_screen.updated) {
+        force_buffer_swap[0] = true;
     }
-
-    FrameBufferUpdate* top_screen = GetFrameBufferInfo(active_thread_id, 0);
-    FrameBufferUpdate* bottom_screen = GetFrameBufferInfo(active_thread_id, 1);
+    if (bottom_screen.updated) {
+        force_buffer_swap[1] = true;
+    }
 
     struct CaptureInfoEntry {
         u32_le address_left;
@@ -647,18 +735,21 @@ void GSP_GPU::ImportDisplayCaptureInfo(Kernel::HLERequestContext& ctx) {
         u32_le stride;
     };
 
-    CaptureInfoEntry top_entry, bottom_entry;
-    // Top Screen
-    top_entry.address_left = top_screen->framebuffer_info[top_screen->index].address_left;
-    top_entry.address_right = top_screen->framebuffer_info[top_screen->index].address_right;
-    top_entry.format = top_screen->framebuffer_info[top_screen->index].format;
-    top_entry.stride = top_screen->framebuffer_info[top_screen->index].stride;
-    // Bottom Screen
-    bottom_entry.address_left = bottom_screen->framebuffer_info[bottom_screen->index].address_left;
-    bottom_entry.address_right =
-        bottom_screen->framebuffer_info[bottom_screen->index].address_right;
-    bottom_entry.format = bottom_screen->framebuffer_info[bottom_screen->index].format;
-    bottom_entry.stride = bottom_screen->framebuffer_info[bottom_screen->index].stride;
+    CaptureInfoEntry top_entry{};
+    CaptureInfoEntry bottom_entry{};
+
+    if (top_screen.info) {
+        top_entry.address_left = top_screen.info->address_left;
+        top_entry.address_right = top_screen.info->address_right;
+        top_entry.format = top_screen.info->format;
+        top_entry.stride = top_screen.info->stride;
+    }
+    if (bottom_screen.info) {
+        bottom_entry.address_left = bottom_screen.info->address_left;
+        bottom_entry.address_right = bottom_screen.info->address_right;
+        bottom_entry.format = bottom_screen.info->format;
+        bottom_entry.stride = bottom_screen.info->stride;
+    }
 
     IPC::RequestBuilder rb = rp.MakeBuilder(9, 0);
     rb.Push(ResultSuccess);
@@ -714,34 +805,41 @@ void GSP_GPU::SaveVramSysArea(Kernel::HLERequestContext& ctx) {
 
     LOG_DEBUG(Service_GSP, "called");
 
-    // Taken from GSP decomp. TODO: GSP seems to so something special
-    // when the fb format results in bpp of 0 or 4, most likely clearing
-    // it, more research needed.
-    static const u8 bpp_per_format[] = {// Valid values
-                                        4, 3, 2, 2, 2,
-                                        // Invalid values
-                                        0, 0, 0};
+    // Formats producing 0 or 4 bytes per pixel use a special hardware path that remains to be
+    // characterized; preserve the established clear behavior for now.
+    static constexpr std::array<u8, 8> bpp_per_format = {4, 3, 2, 2, 2, 0, 0, 0};
 
-    if (active_thread_id == std::numeric_limits<u32>::max()) {
-        LOG_WARNING(Service_GSP, "Called without an active thread.");
-
-        // TODO: Find the right error code.
+    SessionData* session_data = GetSessionData(ctx.Session());
+    if (False(session_data->relay_queue_flags & RelayEventQueueFlags::AllowSaveVramSysArea)) {
         IPC::RequestBuilder rb = rp.MakeBuilder(1, 0);
-        rb.Push(-1);
+        rb.Push(ResultNoSaveVRAMSysAreaPerm);
+        return;
+    }
+    if (session_data->on_vblank_event) {
+        IPC::RequestBuilder rb = rp.MakeBuilder(1, 0);
+        rb.Push(ResultVramOperationBusy);
         return;
     }
 
-    system.Memory().RasterizerFlushVirtualRegion(Memory::VRAM_VADDR, Memory::VRAM_SIZE,
-                                                 Memory::FlushMode::Flush);
-    const auto vram = system.Memory().GetPointer(Memory::VRAM_VADDR);
-    saved_vram.emplace(std::vector<u8>(Memory::VRAM_SIZE));
-    std::memcpy(saved_vram.get().data(), vram, Memory::VRAM_SIZE);
+    const u32 backup_owner = session_data->thread_id;
+    if (!vram_backup_handler.CanSaveCompleteCycle()) {
+        IPC::RequestBuilder rb = rp.MakeBuilder(1, 0);
+        rb.Push(ResultVramOperationBusy);
+        return;
+    }
 
-    auto top_screen = GetFrameBufferInfo(active_thread_id, 0);
+    legacy_saved_vram.reset();
+    if (!vram_backup_handler.SaveVRAMWithState(VramBackupHandler::State::STATE_0, backup_owner)) {
+        LOG_WARNING(Service_GSP, "VRAM save requested from an unexpected state");
+        IPC::RequestBuilder rb = rp.MakeBuilder(1, 0);
+        rb.Push(ResultVramOperationBusy);
+        return;
+    }
+
+    auto top_screen = GetFrameBufferInfo(thread_id_with_rights, 0).info;
     if (top_screen) {
-        u8 bytes_per_pixel =
-            bpp_per_format[top_screen->framebuffer_info[top_screen->index].GetPixelFormat()];
-        const auto top_fb = top_screen->framebuffer_info[top_screen->index];
+        const u8 bytes_per_pixel = bpp_per_format[top_screen->GetPixelFormat()];
+        const auto top_fb = *top_screen;
         if (top_fb.address_left && bytes_per_pixel != 0 && bytes_per_pixel != 4) {
             CopyFrameBuffer(system, FRAMEBUFFER_SAVE_AREA_TOP_LEFT, top_fb.address_left,
                             FRAMEBUFFER_WIDTH * bytes_per_pixel, top_fb.stride,
@@ -761,21 +859,18 @@ void GSP_GPU::SaveVramSysArea(Kernel::HLERequestContext& ctx) {
                              FRAMEBUFFER_WIDTH * bytes_per_pixel, TOP_FRAMEBUFFER_HEIGHT);
         }
 
-        FrameBufferInfo fb_info = top_screen->framebuffer_info[top_screen->index];
-
-        fb_info.address_left = FRAMEBUFFER_SAVE_AREA_TOP_LEFT;
-        fb_info.address_right = FRAMEBUFFER_SAVE_AREA_TOP_RIGHT;
-        fb_info.stride = FRAMEBUFFER_WIDTH * bytes_per_pixel;
-        system.GPU().SetBufferSwap(0, fb_info);
+        top_screen->address_left = FRAMEBUFFER_SAVE_AREA_TOP_LEFT;
+        top_screen->address_right = FRAMEBUFFER_SAVE_AREA_TOP_RIGHT;
+        top_screen->stride = FRAMEBUFFER_WIDTH * bytes_per_pixel;
+        force_buffer_swap[0] = true;
     } else {
-        LOG_WARNING(Service_GSP, "No top screen bound, skipping capture.");
+        LOG_WARNING(Service_GSP, "No valid top screen state, skipping capture");
     }
 
-    auto bottom_screen = GetFrameBufferInfo(active_thread_id, 1);
+    auto bottom_screen = GetFrameBufferInfo(thread_id_with_rights, 1).info;
     if (bottom_screen) {
-        u8 bytes_per_pixel =
-            bpp_per_format[bottom_screen->framebuffer_info[bottom_screen->index].GetPixelFormat()];
-        const auto bottom_fb = bottom_screen->framebuffer_info[bottom_screen->index];
+        const u8 bytes_per_pixel = bpp_per_format[bottom_screen->GetPixelFormat()];
+        const auto bottom_fb = *bottom_screen;
         if (bottom_fb.address_left && bytes_per_pixel != 0 && bytes_per_pixel != 4) {
             CopyFrameBuffer(system, FRAMEBUFFER_SAVE_AREA_BOTTOM, bottom_fb.address_left,
                             FRAMEBUFFER_WIDTH * bytes_per_pixel, bottom_fb.stride,
@@ -785,19 +880,25 @@ void GSP_GPU::SaveVramSysArea(Kernel::HLERequestContext& ctx) {
             ClearFramebuffer(system, FRAMEBUFFER_SAVE_AREA_BOTTOM,
                              FRAMEBUFFER_WIDTH * bytes_per_pixel, BOTTOM_FRAMEBUFFER_HEIGHT);
         }
-        FrameBufferInfo fb_info = bottom_screen->framebuffer_info[bottom_screen->index];
 
-        fb_info.address_left = FRAMEBUFFER_SAVE_AREA_BOTTOM;
-        fb_info.stride = FRAMEBUFFER_WIDTH * bytes_per_pixel;
-        system.GPU().SetBufferSwap(1, fb_info);
+        bottom_screen->address_left = FRAMEBUFFER_SAVE_AREA_BOTTOM;
+        bottom_screen->stride = FRAMEBUFFER_WIDTH * bytes_per_pixel;
+        force_buffer_swap[1] = true;
     } else {
-        LOG_WARNING(Service_GSP, "No bottom screen bound, skipping capture.");
+        LOG_WARNING(Service_GSP, "No valid bottom screen state, skipping capture");
     }
 
-    // Real GSP waits for VBlank here, but we don't need it (?).
+    if (!vram_backup_handler.SaveVRAMWithState(VramBackupHandler::State::STATE_1, backup_owner)) {
+        LOG_WARNING(Service_GSP, "Second VRAM save stage failed");
+        vram_backup_handler.ResetState();
+        IPC::RequestBuilder rb = rp.MakeBuilder(1, 0);
+        rb.Push(ResultVramOperationBusy);
+        return;
+    }
 
-    IPC::RequestBuilder rb = rp.MakeBuilder(1, 0);
-    rb.Push(ResultSuccess);
+    auto callback = std::make_shared<ThreadCallback>(ThreadCallback::Type::SaveVRAMSysArea);
+    session_data->on_vblank_event = ctx.SleepClientThread(
+        "GSP_GPU::SaveVRAMSysArea", std::chrono::nanoseconds(-1), std::move(callback));
 }
 
 void GSP_GPU::RestoreVramSysArea(Kernel::HLERequestContext& ctx) {
@@ -805,31 +906,76 @@ void GSP_GPU::RestoreVramSysArea(Kernel::HLERequestContext& ctx) {
 
     LOG_DEBUG(Service_GSP, "called");
 
-    if (saved_vram) {
-        auto vram = system.Memory().GetPointer(Memory::VRAM_VADDR);
-        std::memcpy(vram, saved_vram.get().data(), Memory::VRAM_SIZE);
-        system.Memory().RasterizerFlushVirtualRegion(Memory::VRAM_VADDR, Memory::VRAM_SIZE,
-                                                     Memory::FlushMode::Invalidate);
+    SessionData* session_data = GetSessionData(ctx.Session());
+    if (False(session_data->relay_queue_flags & RelayEventQueueFlags::AllowSaveVramSysArea)) {
+        IPC::RequestBuilder rb = rp.MakeBuilder(1, 0);
+        rb.Push(ResultNoSaveVRAMSysAreaPerm);
+        return;
+    }
+    if (session_data->on_vblank_event) {
+        IPC::RequestBuilder rb = rp.MakeBuilder(1, 0);
+        rb.Push(ResultVramOperationBusy);
+        return;
     }
 
-    auto top_screen = GetFrameBufferInfo(active_thread_id, 0);
-    if (top_screen) {
-        system.GPU().SetBufferSwap(0, top_screen->framebuffer_info[top_screen->index]);
+    const u32 backup_owner = session_data->thread_id;
+    bool restored_legacy_snapshot = false;
+    if (legacy_saved_vram) {
+        auto* vram = system.Memory().GetPointer(Memory::VRAM_VADDR);
+        if (vram && legacy_saved_vram->size() == Memory::VRAM_SIZE) {
+            std::memcpy(vram, legacy_saved_vram->data(), Memory::VRAM_SIZE);
+            system.Memory().RasterizerFlushVirtualRegion(Memory::VRAM_VADDR, Memory::VRAM_SIZE,
+                                                         Memory::FlushMode::Invalidate);
+            restored_legacy_snapshot = true;
+        } else {
+            LOG_WARNING(Service_GSP, "Discarding an invalid legacy VRAM snapshot");
+        }
+        legacy_saved_vram.reset();
+        vram_backup_handler.ResetState();
+    }
+
+    if (!restored_legacy_snapshot && !vram_backup_handler.CanRestoreCompleteCycle(backup_owner)) {
+        LOG_WARNING(Service_GSP, "VRAM restore requested without a complete owned backup");
+        IPC::RequestBuilder rb = rp.MakeBuilder(1, 0);
+        rb.Push(ResultVramOperationBusy);
+        return;
+    }
+
+    if (!restored_legacy_snapshot && !vram_backup_handler.RestoreVRAMWithState(
+                                         VramBackupHandler::State::STATE_1, backup_owner)) {
+        LOG_WARNING(Service_GSP, "VRAM restore preflight changed unexpectedly");
+        vram_backup_handler.ResetState();
+        IPC::RequestBuilder rb = rp.MakeBuilder(1, 0);
+        rb.Push(ResultVramOperationBusy);
+        return;
+    }
+
+    const auto top_screen = GetFrameBufferInfo(thread_id_with_rights, 0, true);
+    if (top_screen.info) {
+        force_buffer_swap[0] = true;
     } else {
-        LOG_WARNING(Service_GSP, "No top screen bound, skipping restore.");
+        LOG_WARNING(Service_GSP, "No valid top screen state, skipping restore");
     }
 
-    auto bottom_screen = GetFrameBufferInfo(active_thread_id, 1);
-    if (bottom_screen) {
-        system.GPU().SetBufferSwap(1, bottom_screen->framebuffer_info[top_screen->index]);
+    const auto bottom_screen = GetFrameBufferInfo(thread_id_with_rights, 1, true);
+    if (bottom_screen.info) {
+        force_buffer_swap[1] = true;
     } else {
-        LOG_WARNING(Service_GSP, "No bottom screen bound, skipping restore.");
+        LOG_WARNING(Service_GSP, "No valid bottom screen state, skipping restore");
     }
 
-    // Real GSP waits for VBlank here, but we don't need it (?).
+    if (!restored_legacy_snapshot && !vram_backup_handler.RestoreVRAMWithState(
+                                         VramBackupHandler::State::STATE_0, backup_owner)) {
+        LOG_WARNING(Service_GSP, "VRAM restore preflight changed before the first-stage restore");
+        vram_backup_handler.ResetState();
+        IPC::RequestBuilder rb = rp.MakeBuilder(1, 0);
+        rb.Push(ResultVramOperationBusy);
+        return;
+    }
 
-    IPC::RequestBuilder rb = rp.MakeBuilder(1, 0);
-    rb.Push(ResultSuccess);
+    auto callback = std::make_shared<ThreadCallback>(ThreadCallback::Type::RestoreVRAMSysArea);
+    session_data->on_vblank_event = ctx.SleepClientThread(
+        "GSP_GPU::RestoreVramSysArea", std::chrono::nanoseconds(-1), std::move(callback));
 }
 
 Result GSP_GPU::AcquireGpuRight(const Kernel::HLERequestContext& ctx,
@@ -861,7 +1007,7 @@ Result GSP_GPU::AcquireGpuRight(const Kernel::HLERequestContext& ctx,
     gpu.PicaCore().vs_setup.requires_fixup = requires_shader_fixup;
     gpu.PicaCore().gs_setup.requires_fixup = requires_shader_fixup;
 
-    if (active_thread_id == session_data->thread_id) {
+    if (thread_id_with_rights == session_data->thread_id) {
         return {ErrorDescription::AlreadyDone, ErrorModule::GX, ErrorSummary::Success,
                 ErrorLevel::Success};
     }
@@ -870,14 +1016,14 @@ Result GSP_GPU::AcquireGpuRight(const Kernel::HLERequestContext& ctx,
 
     if (blocking) {
         // TODO: The thread should be put to sleep until acquired.
-        ASSERT_MSG(active_thread_id == std::numeric_limits<u32>::max(),
+        ASSERT_MSG(thread_id_with_rights == std::numeric_limits<u32>::max(),
                    "Sleeping for GPU right is not yet supported.");
-    } else if (active_thread_id != std::numeric_limits<u32>::max()) {
+    } else if (thread_id_with_rights != std::numeric_limits<u32>::max()) {
         return {ErrorDescription::Busy, ErrorModule::GX, ErrorSummary::WouldBlock,
                 ErrorLevel::Status};
     }
 
-    active_thread_id = session_data->thread_id;
+    thread_id_with_rights = session_data->thread_id;
     active_client_thread_id = ctx.ClientThread()->thread_id;
     return ResultSuccess;
 }
@@ -903,17 +1049,21 @@ void GSP_GPU::AcquireRight(Kernel::HLERequestContext& ctx) {
     rb.Push(result);
 }
 
-void GSP_GPU::ReleaseRight(const SessionData* session_data) {
-    ASSERT_MSG(active_thread_id == session_data->thread_id,
-               "Wrong thread tried to release GPU right");
-    active_thread_id = std::numeric_limits<u32>::max();
-    active_client_thread_id = std::numeric_limits<u32>::max();
+void GSP_GPU::ReleaseRight(SessionData* session_data) {
+    if (thread_id_with_rights == session_data->thread_id) {
+        FinishPendingVBlankWait(session_data);
+        thread_id_with_rights = std::numeric_limits<u32>::max();
+        active_client_thread_id = std::numeric_limits<u32>::max();
+        vram_backup_handler.ResetState();
+        legacy_saved_vram.reset();
+    }
 }
 
 void GSP_GPU::ReleaseRight(Kernel::HLERequestContext& ctx) {
     IPC::RequestParser rp(ctx);
 
     const SessionData* session_data = GetSessionData(ctx.Session());
+    // Success even if wrong thread calls this function.
     ReleaseRight(session_data);
 
     IPC::RequestBuilder rb = rp.MakeBuilder(1, 0);
@@ -972,22 +1122,33 @@ SessionData* GSP_GPU::FindRegisteredThreadData(u32 thread_id) {
 }
 
 template <class Archive>
-void GSP_GPU::serialize(Archive& ar, const unsigned int) {
+void GSP_GPU::serialize(Archive& ar, const unsigned int file_version) {
     DEBUG_SERIALIZATION_POINT;
     ar& boost::serialization::base_object<Kernel::SessionRequestHandler>(*this);
     ar & shared_memory;
-    ar & active_thread_id;
+    ar & thread_id_with_rights;
     ar & active_client_thread_id;
     ar & first_initialization;
     ar & used_thread_ids;
-    ar & saved_vram;
+    ar & legacy_saved_vram;
     ar & delay_texture_copy_completion;
     ar & pending_interrupts;
     ar & perf_recorder;
+
+    if (file_version >= 1) {
+        ar & framebuffer_cache;
+        ar & force_buffer_swap;
+        ar & vram_backup_handler;
+    } else if (Archive::is_loading::value) {
+        framebuffer_cache.Reset();
+        force_buffer_swap = {};
+        vram_backup_handler.ResetState();
+    }
 }
 SERIALIZE_IMPL(GSP_GPU)
 
-GSP_GPU::GSP_GPU(Core::System& system) : ServiceFramework("gsp::Gpu", 4), system(system) {
+GSP_GPU::GSP_GPU(Core::System& system)
+    : ServiceFramework("gsp::Gpu", 4), system(system), vram_backup_handler(system) {
     static const FunctionInfo functions[] = {
         // clang-format off
         {0x0001, &GSP_GPU::WriteHWRegs, "WriteHWRegs"},
@@ -1045,12 +1206,21 @@ std::unique_ptr<Kernel::SessionRequestHandler::SessionDataBase> GSP_GPU::MakeSes
 }
 
 template <class Archive>
-void SessionData::serialize(Archive& ar, const unsigned int) {
+void SessionData::serialize(Archive& ar, const unsigned int file_version) {
     ar& boost::serialization::base_object<Kernel::SessionRequestHandler::SessionDataBase>(*this);
     ar & gsp;
     ar & interrupt_event;
     ar & thread_id;
     ar & registered;
+
+    if (file_version >= 1) {
+        ar & relay_queue_flags;
+        ar & on_vblank_event;
+    } else if (Archive::is_loading::value) {
+        relay_queue_flags =
+            registered ? RelayEventQueueFlags::AllowSaveVramSysArea : RelayEventQueueFlags{};
+        on_vblank_event.reset();
+    }
 }
 SERIALIZE_IMPL(SessionData)
 
@@ -1067,4 +1237,181 @@ SessionData::~SessionData() {
     gsp->used_thread_ids[thread_id] = false;
 }
 
+VramBackupHandler::Transition VramBackupHandler::PlanSave(State requested_state,
+                                                          State current_state) {
+    if (requested_state == State::STATE_0 && current_state == State::STATE_0) {
+        return {VRAMBankBackupMask::MASK_1, State::STATE_1, true};
+    }
+    if (requested_state == State::STATE_1 && current_state == State::STATE_1) {
+        return {VRAMBankBackupMask::MASK_2, State::STATE_2, true};
+    }
+    return {};
+}
+
+VramBackupHandler::Transition VramBackupHandler::PlanRestore(State requested_state,
+                                                             State current_state) {
+    if (requested_state == State::STATE_1 && current_state == State::STATE_2) {
+        return {VRAMBankBackupMask::MASK_2, State::STATE_1, true};
+    }
+    if (requested_state == State::STATE_0 && current_state == State::STATE_1) {
+        return {VRAMBankBackupMask::MASK_1, State::STATE_0, true};
+    }
+    return {};
+}
+
+bool VramBackupHandler::ValidateSerializedState(State state, bool has_owner,
+                                                const std::array<bool, BANK_COUNT>& valid,
+                                                const std::array<size_t, BANK_COUNT>& sizes) {
+    if (state != State::STATE_0 && state != State::STATE_1 && state != State::STATE_2) {
+        return false;
+    }
+
+    for (size_t i = 0; i < BANK_COUNT; ++i) {
+        if (sizes[i] != 0 && sizes[i] != VRAM_BACKUP_BANK_SIZE) {
+            return false;
+        }
+        if (valid[i] != (sizes[i] == VRAM_BACKUP_BANK_SIZE)) {
+            return false;
+        }
+    }
+
+    if (state == State::STATE_0) {
+        return !has_owner &&
+               std::none_of(valid.begin(), valid.end(), [](bool bank_valid) { return bank_valid; });
+    }
+    if (!has_owner) {
+        return false;
+    }
+
+    for (size_t i = 0; i < BANK_COUNT; ++i) {
+        const bool required_for_state_one = True(VRAMBankBackupMask::MASK_1 & mask_per_bank[i]);
+        const bool required_for_state_two =
+            state == State::STATE_2 && True(VRAMBankBackupMask::MASK_2 & mask_per_bank[i]);
+        if ((required_for_state_one || required_for_state_two) && !valid[i]) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool VramBackupHandler::AreBanksAccessible(VRAMBankBackupMask mask) const {
+    for (size_t i = 0; i < BANK_COUNT; ++i) {
+        if (True(mask & mask_per_bank[i])) {
+            const VAddr bank_vaddr = Memory::VRAM_VADDR + i * VRAM_BACKUP_BANK_SIZE;
+            if (!system.Memory().GetPointer(bank_vaddr)) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+bool VramBackupHandler::AreBanksRestorable(VRAMBankBackupMask mask) const {
+    for (size_t i = 0; i < BANK_COUNT; ++i) {
+        if (True(mask & mask_per_bank[i])) {
+            const VAddr bank_vaddr = Memory::VRAM_VADDR + i * VRAM_BACKUP_BANK_SIZE;
+            if (!valid_banks[i] || vram_backup[i].size() != VRAM_BACKUP_BANK_SIZE ||
+                !system.Memory().GetPointer(bank_vaddr)) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+bool VramBackupHandler::CanSaveCompleteCycle() const {
+    return curr_state == State::STATE_0 && !ownership.HasOwner() &&
+           AreBanksAccessible(VRAMBankBackupMask::MASK_1) &&
+           AreBanksAccessible(VRAMBankBackupMask::MASK_2);
+}
+
+bool VramBackupHandler::CanRestoreCompleteCycle(u32 owner_thread_id) const {
+    return curr_state == State::STATE_2 && ownership.IsOwnedBy(owner_thread_id) &&
+           AreBanksRestorable(VRAMBankBackupMask::MASK_2) &&
+           AreBanksRestorable(VRAMBankBackupMask::MASK_1);
+}
+
+bool VramBackupHandler::SaveVRAMWithState(State state, u32 owner_thread_id) {
+    const Transition transition = PlanSave(state, curr_state);
+    if (!transition.applies || !AreBanksAccessible(transition.mask)) {
+        return false;
+    }
+    if ((state == State::STATE_0 && ownership.HasOwner()) ||
+        (state != State::STATE_0 && !ownership.IsOwnedBy(owner_thread_id))) {
+        return false;
+    }
+
+    for (size_t i = 0; i < BANK_COUNT; ++i) {
+        if (True(transition.mask & mask_per_bank[i]) && !SaveVRAMBank(i)) {
+            return false;
+        }
+    }
+
+    curr_state = transition.next_state;
+    if (state == State::STATE_0 && !ownership.Claim(owner_thread_id)) {
+        ResetState();
+        return false;
+    }
+    return true;
+}
+
+bool VramBackupHandler::RestoreVRAMWithState(State state, u32 owner_thread_id) {
+    const Transition transition = PlanRestore(state, curr_state);
+    if (!transition.applies || !ownership.IsOwnedBy(owner_thread_id) ||
+        !AreBanksRestorable(transition.mask)) {
+        return false;
+    }
+
+    for (size_t i = 0; i < BANK_COUNT; ++i) {
+        if (True(transition.mask & mask_per_bank[i]) && !RestoreVRAMBank(i)) {
+            return false;
+        }
+    }
+
+    curr_state = transition.next_state;
+    if (curr_state == State::STATE_0) {
+        ResetState();
+    }
+    return true;
+}
+
+bool VramBackupHandler::SaveVRAMBank(size_t bank_id) {
+    ASSERT(bank_id < BANK_COUNT);
+
+    const VAddr bank_vaddr = Memory::VRAM_VADDR + bank_id * VRAM_BACKUP_BANK_SIZE;
+    system.Memory().RasterizerFlushVirtualRegion(bank_vaddr, VRAM_BACKUP_BANK_SIZE,
+                                                 Memory::FlushMode::Flush);
+
+    const u8* data = system.Memory().GetPointer(bank_vaddr);
+    if (!data) {
+        valid_banks[bank_id] = false;
+        return false;
+    }
+
+    vram_backup[bank_id].resize(VRAM_BACKUP_BANK_SIZE);
+    std::memcpy(vram_backup[bank_id].data(), data, VRAM_BACKUP_BANK_SIZE);
+    valid_banks[bank_id] = true;
+    return true;
+}
+
+bool VramBackupHandler::RestoreVRAMBank(size_t bank_id) {
+    ASSERT(bank_id < BANK_COUNT);
+
+    if (!valid_banks[bank_id] || vram_backup[bank_id].size() != VRAM_BACKUP_BANK_SIZE) {
+        return false;
+    }
+
+    const VAddr bank_vaddr = Memory::VRAM_VADDR + bank_id * VRAM_BACKUP_BANK_SIZE;
+    u8* data = system.Memory().GetPointer(bank_vaddr);
+    if (!data) {
+        return false;
+    }
+
+    std::memcpy(data, vram_backup[bank_id].data(), VRAM_BACKUP_BANK_SIZE);
+    system.Memory().RasterizerFlushVirtualRegion(bank_vaddr, VRAM_BACKUP_BANK_SIZE,
+                                                 Memory::FlushMode::Invalidate);
+    return true;
+}
 } // namespace Service::GSP
+
+SERIALIZE_EXPORT_IMPL(Service::GSP::GSP_GPU::ThreadCallback)
